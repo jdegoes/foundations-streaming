@@ -17,6 +17,7 @@ import zio._
 import zio.test._
 import zio.test.TestAspect._
 import scala.annotation.tailrec
+import java.{ util => ju }
 
 /**
  * Pull-based streams are "pulled from" by the consumer, which typically "runs"
@@ -94,38 +95,214 @@ object PullBased extends ZIOSpecDefault {
   trait Stream[+A] { self =>
     def iterator(): ClosableIterator[A]
 
-    final def map[B](f: A => B): Stream[B] = ???
-
-    final def take(n: Int): Stream[A] = ???
-
-    final def drop(n: Int): Stream[A] = ???
-
-    final def filter(f: A => Boolean): Stream[A] = ???
-
-    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] = ???
-
-    final def flatMap[B](f: A => Stream[B]): Stream[B] = ???
-
-    final def mapAccum[S, B](initial: S)(f: (S, A) => (S, B)): Stream[B] = ???
-
-    final def foldLeft[S](initial: S)(f: (S, A) => S): S = ???
-
-    final def zip[B](that: Stream[B]): Stream[(A, B)] = ???
-
-    final def merge[A1 >: A](that: Stream[A1]): Stream[A1] = ???
-
-    final def runCollect: Chunk[A] = {
-      val builder = ChunkBuilder.make[A]()
-
-      val iter = iterator()
-
-      while (iter.hasNext) {
-        builder += iter.next()
+    final def map[B](f: A => B): Stream[B] =
+      new Stream[B] {
+        def iterator(): ClosableIterator[B] = self.iterator().map(f)
       }
 
-      iter.close()
+    final def take(n: Int): Stream[A] =
+      new Stream[A] {
+        def iterator(): ClosableIterator[A] =
+          new ClosableIterator[A] {
+            val outer = self.iterator()
+            var taken = 0
 
-      builder.result()
+            def hasNext: Boolean =
+              (taken < n) && outer.hasNext
+
+            def next(): A = {
+              val element = outer.next()
+
+              taken = taken + 1
+
+              element
+            }
+
+            def close(): Unit = outer.close()
+          }
+      }
+
+    final def drop(n: Int): Stream[A] =
+      new Stream[A] {
+        def iterator(): ClosableIterator[A] =
+          new ClosableIterator[A] {
+            val outer = self.iterator()
+
+            (1 to n).foreach { _ =>
+              if (outer.hasNext) outer.next()
+            }
+
+            def hasNext: Boolean = outer.hasNext
+
+            def next(): A = outer.next()
+
+            def close(): Unit = outer.close()
+          }
+      }
+
+    final def filter(f: A => Boolean): Stream[A] =
+      new Stream[A] {
+        def iterator(): ClosableIterator[A] =
+          new ClosableIterator[A] {
+            val outer  = self.iterator()
+            var nextEl = findNext()
+
+            @tailrec
+            def findNext(): Option[A] =
+              if (!outer.hasNext) None
+              else {
+                val e = outer.next()
+                if (f(e)) Some(e)
+                else findNext()
+              }
+
+            def hasNext: Boolean = nextEl.isDefined
+
+            def next(): A = {
+              val e = nextEl.get
+              nextEl = findNext()
+              e
+            }
+
+            def close(): Unit = outer.close()
+          }
+      }
+
+    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] =
+      new Stream[A1] {
+        def iterator(): ClosableIterator[A1] =
+          new ClosableIterator[A1] {
+            var current: ClosableIterator[A1] = self.iterator()
+            var inLeft                        = true
+
+            @tailrec
+            def hasNext: Boolean = {
+              val isNext = current.hasNext
+
+              if (!isNext && inLeft) {
+                current.close()
+                current = that.iterator()
+                inLeft = false
+                hasNext
+              } else isNext
+            }
+
+            def next(): A1 = current.next()
+
+            def close(): Unit = current.close()
+          }
+      }
+
+    final def flatMap[B](f: A => Stream[B]): Stream[B] =
+      new Stream[B] {
+        def iterator(): ClosableIterator[B] =
+          self.iterator().flatMap(a => f(a).iterator())
+      }
+
+    final def mapAccum[S, B](initial: S)(f: (S, A) => (S, B)): Stream[B] =
+      new Stream[B] {
+        def iterator(): ClosableIterator[B] =
+          new ClosableIterator[B] {
+            val iter  = self.iterator()
+            var state = initial
+
+            def close(): Unit = iter.close()
+
+            def hasNext: Boolean = iter.hasNext
+
+            def next(): B = {
+              val a = iter.next()
+
+              val (newState, b) = f(state, a)
+
+              state = newState
+
+              b
+            }
+          }
+      }
+
+    final def foldLeft[S](initial: S)(f: (S, A) => S): S = {
+      var state = initial
+      val iter  = iterator()
+
+      try {
+        while (iter.hasNext) {
+          state = f(state, iter.next())
+        }
+      } finally {
+        iter.close()
+      }
+
+      state
+    }
+
+    final def zip[B](that: Stream[B]): Stream[(A, B)] =
+      new Stream[(A, B)] {
+        def iterator(): ClosableIterator[(A, B)] =
+          new ClosableIterator[(A, B)] {
+            val left  = self.iterator()
+            val right = that.iterator()
+
+            def close(): Unit =
+              try left.close()
+              finally right.close()
+
+            def hasNext: Boolean = left.hasNext && right.hasNext
+
+            def next(): (A, B) = (left.next(), right.next())
+          }
+      }
+
+    final def merge[A1 >: A](that: Stream[A1]): Stream[A1] =
+      new Stream[A1] {
+        def iterator(): ClosableIterator[A1] =
+          new ClosableIterator[A1] {
+            val left     = self.iterator()
+            val right    = that.iterator()
+            var readLeft = true
+
+            def hasNext: Boolean = left.hasNext || right.hasNext
+
+            def close(): Unit =
+              try left.close()
+              finally right.close()
+
+            @tailrec
+            def next(): A1 =
+              if (!left.hasNext && !right.hasNext) throw new NoSuchElementException("Illegal invocation of next()")
+              else if (readLeft) {
+                if (left.hasNext) {
+                  readLeft = false
+                  left.next()
+                } else {
+                  readLeft = false
+                  next()
+                }
+              } else {
+                if (right.hasNext) {
+                  readLeft = true
+                  right.next()
+                } else {
+                  readLeft = true
+                  next()
+                }
+              }
+
+          }
+      }
+
+    final def mkString(sep: String): String =
+      self.foldLeft("") {
+        case (acc, a) =>
+          if (acc.nonEmpty) acc + sep + a.toString()
+          else a.toString()
+      }
+
+    final def runCollect: Chunk[A] = foldLeft[Chunk[A]](Chunk.empty[A])(_ :+ _)
+
+    final def runLast: Option[A] = foldLeft[Option[A]](None) {
+      case (_, a) => Some(a)
     }
   }
   object Stream {
@@ -145,20 +322,87 @@ object PullBased extends ZIOSpecDefault {
         }
       }
 
-    def unfold[S, A](initial: S)(f: S => Option[S]): Stream[S] = ???
+    def unfold[S, A](initial: S)(f: S => Option[S]): Stream[S] =
+      new Stream[S] {
+        def iterator(): ClosableIterator[S] =
+          new ClosableIterator[S] {
+            var next0: Option[S] = Some(initial)
+
+            def close(): Unit = ()
+
+            def hasNext: Boolean = next0.isDefined
+
+            def next(): S = {
+              var s = next0.get
+
+              next0 = f(s)
+
+              s
+            }
+          }
+      }
 
     def iterate[S](initial: S)(f: S => S): Stream[S] = unfold(initial)(s => Some(f(s)))
 
     def attempt[A](a: => A): Stream[A] =
-      ???
+      new Stream[A] {
+        def iterator(): ClosableIterator[A] =
+          new ClosableIterator[A] {
+            lazy val element = a
+            var isFirst      = true
+
+            def hasNext: Boolean = isFirst
+
+            def close(): Unit = ()
+
+            def next(): A =
+              if (!isFirst) {
+                throw new NoSuchElementException("Already consumed singleton element")
+              } else {
+                isFirst = false
+                element
+              }
+          }
+      }
 
     def suspend[A](stream: => Stream[A]): Stream[A] =
-      ???
+      new Stream[A] {
+        def iterator(): ClosableIterator[A] =
+          new ClosableIterator[A] {
+            lazy val streamIter = stream.iterator()
+
+            def close(): Unit = streamIter.close()
+
+            def hasNext: Boolean = streamIter.hasNext
+
+            def next(): A = streamIter.next()
+          }
+      }
 
     def fromFile(file: String): Stream[Byte] = {
       import java.io.FileInputStream
 
-      ???
+      new Stream[Byte] {
+        def iterator(): ClosableIterator[Byte] =
+          new ClosableIterator[Byte] {
+            val fis  = new FileInputStream(file)
+            var byte = fis.read()
+
+            def close(): Unit = fis.close()
+
+            def hasNext: Boolean = byte >= 0
+
+            def next(): Byte = {
+              if (byte < 0) throw new ju.NoSuchElementException("There are no more bytes to read")
+
+              val b = byte.toByte
+
+              byte = fis.read()
+
+              b
+            }
+          }
+      }
     }
   }
 
@@ -177,7 +421,7 @@ object PullBased extends ZIOSpecDefault {
         for {
           mapped <- ZIO.succeed(stream.map(_ + 1))
         } yield assertTrue(mapped.runCollect == Chunk(2, 3, 4, 5))
-      } @@ ignore +
+      } +
         /**
          * EXERCISE
          *
@@ -190,7 +434,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             taken <- ZIO.succeed(stream.take(2))
           } yield assertTrue(taken.runCollect == Chunk(1, 2))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -203,7 +447,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             dropped <- ZIO.succeed(stream.drop(2))
           } yield assertTrue(dropped.runCollect == Chunk(3, 4))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -216,7 +460,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             filtered <- ZIO.succeed(stream.filter(_ % 2 == 0))
           } yield assertTrue(filtered.runCollect == Chunk(2, 4))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -230,7 +474,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             appended <- ZIO.succeed(stream1 ++ stream2)
           } yield assertTrue(appended.runCollect == Chunk(1, 2, 3, 4, 5, 6, 7, 8))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -256,7 +500,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             mapped <- ZIO.succeed(stream.mapAccum(0)((s, a) => (s + a, s + a)))
           } yield assertTrue(mapped.runCollect == Chunk(1, 3, 6, 10))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -269,7 +513,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             folded <- ZIO.succeed(stream.foldLeft(0)(_ + _))
           } yield assertTrue(folded == 10)
-        } @@ ignore
+        }
     } +
       suite("advanced constructors") {
 
