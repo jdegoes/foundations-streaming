@@ -41,83 +41,76 @@ import scala.annotation.tailrec
  */
 object SimpleStream extends ZIOSpecDefault {
   sealed trait Stream[+A] { self =>
-    final def map[B](f: A => B): Stream[B] = 
-      self match {
-        case Stream.Empty => Stream.Empty
-        case Stream.Cons(head, tail) => 
-          Stream.Cons(() => f(head()), () => tail().map(f))
-      }
+    final def map[B](f: A => B): Stream[B] = self.flatMap(a => Stream(f(a)))
 
     final def take(n: Int): Stream[A] =
-      if (n <= 0) Stream.Empty  
-      else self match {
+      if (n <= 0) Stream.Empty
+      else
+        self match {
+          case Stream.Empty            => Stream.Empty
+          case Stream.Defer(stream)    => Stream.suspend(stream().take(n))
+          case Stream.Cons(head, tail) => Stream.Cons(head, tail.take(n - 1))
+        }
+
+    final def drop(n: Int): Stream[A] =
+      if (n <= 0) self
+      else
+        self match {
+          case Stream.Empty => Stream.Empty
+
+          case Stream.Defer(stream) => Stream.suspend(stream().drop(n))
+
+          case Stream.Cons(_, tail) => Stream.suspend(tail.drop(n - 1))
+        }
+
+    final def filter(f: A => Boolean): Stream[A] = self.flatMap(a => if (f(a)) Stream(a) else Stream())
+
+    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] =
+      self match {
+        case Stream.Empty => that
+
+        case Stream.Defer(stream) => Stream.suspend(stream() ++ that)
+
+        case Stream.Cons(head, tail) => Stream.Cons(head, tail ++ that)
+      }
+
+    final def flatMap[B](f: A => Stream[B]): Stream[B] =
+      self match {
         case Stream.Empty => Stream.Empty
-        case Stream.Cons(head, tail) =>
-          Stream.Cons(() => head(), () => tail().take(n - 1))
+
+        case Stream.Defer(stream) => Stream.suspend(stream().flatMap(f))
+
+        case Stream.Cons(head, tail) => Stream.suspend(f(head) ++ tail.flatMap(f))
       }
 
-    final def drop(n: Int): Stream[A] = 
-      if (n <= 0) self 
-      else self match {
+    final def mapAccum[S, B](initial: S)(f: (S, A) => (S, B)): Stream[B] =
+      self match {
         case Stream.Empty => Stream.Empty
-        
-        case Stream.Cons(_, tail) => tail().drop(n - 1)
-      }
 
-    final def filter(f: A => Boolean): Stream[A] = 
-      self match {
-        case Stream.Empty => Stream.Empty 
+        case Stream.Defer(stream) => Stream.Defer(() => stream().mapAccum(initial)(f))
+
         case Stream.Cons(head, tail) =>
-          val a = head() 
-          if (f(a)) Stream.Cons(() => a, () => tail().filter(f))
-          else tail().filter(f)
+          Stream.suspend {
+            val (newState, b) = f(initial, head)
+
+            Stream.Cons(b, tail.mapAccum(newState)(f))
+          }
       }
 
-    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] = 
+    final def foldLeft[B](initial: B)(f: (B, A) => B): B =
       self match {
-        case Stream.Empty => that 
+        case Stream.Empty => initial
 
-        case Stream.Cons(head, tail) => Stream.Cons(head, () => tail() ++ that)
+        case Stream.Defer(stream) => stream().foldLeft(initial)(f)
+
+        case Stream.Cons(head, tail) => tail.foldLeft(f(initial, head))(f)
       }
 
-    final def flatMap[B](f: A => Stream[B]): Stream[B] = 
-      self match {
-        case Stream.Empty => Stream.Empty 
+    final def runCollect: Chunk[A] = foldLeft[Chunk[A]](Chunk.empty[A])(_ :+ _)
 
-        case Stream.Cons(head, tail) => 
-          f(head()) ++ tail().flatMap(f)
-      }
-
-    final def mapAccum[S, B](initial: S)(f: (S, A) => (S, B)): Stream[B] = 
-      self match {
-        case Stream.Empty => 
-          Stream.Empty 
-
-        case Stream.Cons(head, tail) => 
-          val (newState, b) = f(initial, head())
-
-          Stream.Cons(() => b, () => tail().mapAccum(newState)(f))
-      }
-
-    final def foldLeft[B](initial: B)(f: (B, A) => B): B = 
-      self match {
-        case Stream.Empty => initial 
-
-        case Stream.Cons(head, tail) => 
-          tail().foldLeft(f(initial, head()))(f)
-      }
-
-    final def runCollect: Chunk[A] =
-      this match {
-        case Stream.Empty            => Chunk.empty
-        case Stream.Cons(head, tail) => Chunk.single(head()) ++ tail().runCollect
-      }
-
-    final def runLast: Option[A] = 
-      this match {
-        case Stream.Empty            => None 
-        case Stream.Cons(head, tail) => tail().runLast.orElse(Some(head()))
-      }
+    final def runLast: Option[A] = foldLeft[Option[A]](None) {
+      case (_, a) => Some(a)
+    }
 
     final def words(implicit ev: A <:< String): Stream[String] = {
       val strings: Stream[String] = self.map(ev)
@@ -127,28 +120,33 @@ object SimpleStream extends ZIOSpecDefault {
       chunkStream.flatMap(chunk => Stream(chunk: _*))
     }
 
-    final def wordCount(implicit ev: A <:< String): Map[String, Int] = {
-      words.mapAccum[Map[String, Int], Map[String, Int]](Map()) {
-        case (map, word) => 
-          val newMap = map.updated(word, map.get(word).getOrElse(0) + 1)
+    final def wordCount(implicit ev: A <:< String): Map[String, Int] =
+      words
+        .mapAccum[Map[String, Int], Map[String, Int]](Map()) {
+          case (map, word) =>
+            val newMap = map.updated(word, map.get(word).getOrElse(0) + 1)
 
-          (newMap, newMap)
-      }.runLast.getOrElse(Map.empty)
-    }
+            (newMap, newMap)
+        }
+        .runLast
+        .getOrElse(Map.empty)
   }
   object Stream {
-    case object Empty                                               extends Stream[Nothing]
-    final case class Cons[+A](head: () => A, tail: () => Stream[A]) extends Stream[A]
+    case object Empty                                   extends Stream[Nothing]
+    final case class Defer[+A](stream: () => Stream[A]) extends Stream[A]
+    final case class Cons[+A](head: A, tail: Stream[A]) extends Stream[A]
 
     def apply[A](as: A*): Stream[A] = {
       def loop(list: List[A]): Stream[A] =
         list match {
           case Nil          => Empty
-          case head :: tail => Cons(() => head, () => loop(tail))
+          case head :: tail => Cons(head, loop(tail))
         }
 
       loop(as.toList)
     }
+
+    def suspend[A](make: => Stream[A]): Stream[A] = Stream.Defer(() => make)
 
     def unfold[S, A](initial: S)(f: S => Option[S]): Stream[S] = ???
 
