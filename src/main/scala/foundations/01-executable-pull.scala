@@ -487,7 +487,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             flatMapped <- ZIO.succeed(stream.flatMap(a => Stream(a, a)))
           } yield assertTrue(flatMapped.runCollect == Chunk(1, 1, 2, 2, 3, 3, 4, 4))
-        } +
+        } @@ ignore +
         /**
          * EXERCISE
          *
@@ -594,7 +594,7 @@ object PullBased extends ZIOSpecDefault {
           for {
             zipped <- ZIO.succeed(stream1.zip(stream2))
           } yield assertTrue(zipped.runCollect == Chunk((1, 5), (2, 6), (3, 7), (4, 8)))
-        } +
+        } @@ ignore +
           /**
            * EXERCISE
            *
@@ -607,7 +607,7 @@ object PullBased extends ZIOSpecDefault {
             for {
               merged <- ZIO.succeed(stream1.merge(stream2))
             } yield assertTrue(merged.runCollect == Chunk(1, 5, 2, 6, 3, 7, 4, 8))
-          }
+          } @@ ignore
       }
   }
 }

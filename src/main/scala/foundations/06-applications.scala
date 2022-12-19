@@ -11,6 +11,12 @@ import zio._
 
 import zio.stream._
 
+/**
+ * Build a command-line application that accepts a number of files.
+ * Each file contains text. Perform a word-count operation on all
+ * files in parallel, and then aggregate the word count information.
+ * Finally, display the aggregated word count.
+ */
 object StreamApp extends ZIOAppDefault {
   def run = Console.printLine("Hello World!")
 }
