@@ -40,28 +40,101 @@ import scala.annotation.tailrec
  * your knowledge of Scala collections to understand streams.
  */
 object SimpleStream extends ZIOSpecDefault {
-  sealed trait Stream[+A] {
-    final def map[B](f: A => B): Stream[B] = ???
+  sealed trait Stream[+A] { self =>
+    final def map[B](f: A => B): Stream[B] = 
+      self match {
+        case Stream.Empty => Stream.Empty
+        case Stream.Cons(head, tail) => 
+          Stream.Cons(() => f(head()), () => tail().map(f))
+      }
 
-    final def take(n: Int): Stream[A] = ???
+    final def take(n: Int): Stream[A] =
+      if (n <= 0) Stream.Empty  
+      else self match {
+        case Stream.Empty => Stream.Empty
+        case Stream.Cons(head, tail) =>
+          Stream.Cons(() => head(), () => tail().take(n - 1))
+      }
 
-    final def drop(n: Int): Stream[A] = ???
+    final def drop(n: Int): Stream[A] = 
+      if (n <= 0) self 
+      else self match {
+        case Stream.Empty => Stream.Empty
+        
+        case Stream.Cons(_, tail) => tail().drop(n - 1)
+      }
 
-    final def filter(f: A => Boolean): Stream[A] = ???
+    final def filter(f: A => Boolean): Stream[A] = 
+      self match {
+        case Stream.Empty => Stream.Empty 
+        case Stream.Cons(head, tail) =>
+          val a = head() 
+          if (f(a)) Stream.Cons(() => a, () => tail().filter(f))
+          else tail().filter(f)
+      }
 
-    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] = ???
+    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] = 
+      self match {
+        case Stream.Empty => that 
 
-    final def flatMap[B](f: A => Stream[B]): Stream[B] = ???
+        case Stream.Cons(head, tail) => Stream.Cons(head, () => tail() ++ that)
+      }
 
-    final def mapAccum[S, B](initial: S)(f: (S, A) => (S, B)): Stream[B] = ???
+    final def flatMap[B](f: A => Stream[B]): Stream[B] = 
+      self match {
+        case Stream.Empty => Stream.Empty 
 
-    final def foldLeft[B](initial: B)(f: (B, A) => B): B = ???
+        case Stream.Cons(head, tail) => 
+          f(head()) ++ tail().flatMap(f)
+      }
+
+    final def mapAccum[S, B](initial: S)(f: (S, A) => (S, B)): Stream[B] = 
+      self match {
+        case Stream.Empty => 
+          Stream.Empty 
+
+        case Stream.Cons(head, tail) => 
+          val (newState, b) = f(initial, head())
+
+          Stream.Cons(() => b, () => tail().mapAccum(newState)(f))
+      }
+
+    final def foldLeft[B](initial: B)(f: (B, A) => B): B = 
+      self match {
+        case Stream.Empty => initial 
+
+        case Stream.Cons(head, tail) => 
+          tail().foldLeft(f(initial, head()))(f)
+      }
 
     final def runCollect: Chunk[A] =
       this match {
         case Stream.Empty            => Chunk.empty
         case Stream.Cons(head, tail) => Chunk.single(head()) ++ tail().runCollect
       }
+
+    final def runLast: Option[A] = 
+      this match {
+        case Stream.Empty            => None 
+        case Stream.Cons(head, tail) => tail().runLast.orElse(Some(head()))
+      }
+
+    final def words(implicit ev: A <:< String): Stream[String] = {
+      val strings: Stream[String] = self.map(ev)
+
+      val chunkStream = strings.map(string => Chunk.fromArray(string.split("\\s+")))
+
+      chunkStream.flatMap(chunk => Stream(chunk: _*))
+    }
+
+    final def wordCount(implicit ev: A <:< String): Map[String, Int] = {
+      words.mapAccum[Map[String, Int], Map[String, Int]](Map()) {
+        case (map, word) => 
+          val newMap = map.updated(word, map.get(word).getOrElse(0) + 1)
+
+          (newMap, newMap)
+      }.runLast.getOrElse(Map.empty)
+    }
   }
   object Stream {
     case object Empty                                               extends Stream[Nothing]
@@ -97,7 +170,7 @@ object SimpleStream extends ZIOSpecDefault {
         for {
           mapped <- ZIO.succeed(stream.map(_ + 1))
         } yield assertTrue(mapped.runCollect == Chunk(2, 3, 4, 5))
-      } @@ ignore +
+      } +
         /**
          * EXERCISE
          *
@@ -110,7 +183,7 @@ object SimpleStream extends ZIOSpecDefault {
           for {
             taken <- ZIO.succeed(stream.take(2))
           } yield assertTrue(taken.runCollect == Chunk(1, 2))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -123,7 +196,7 @@ object SimpleStream extends ZIOSpecDefault {
           for {
             dropped <- ZIO.succeed(stream.drop(2))
           } yield assertTrue(dropped.runCollect == Chunk(3, 4))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -136,7 +209,7 @@ object SimpleStream extends ZIOSpecDefault {
           for {
             filtered <- ZIO.succeed(stream.filter(_ % 2 == 0))
           } yield assertTrue(filtered.runCollect == Chunk(2, 4))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -152,7 +225,7 @@ object SimpleStream extends ZIOSpecDefault {
           for {
             appended <- ZIO.succeed(stream1 ++ stream2)
           } yield assertTrue(appended.runCollect == Chunk(1, 2, 3, 4, 5, 6, 7, 8))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -165,7 +238,7 @@ object SimpleStream extends ZIOSpecDefault {
           for {
             flatMapped <- ZIO.succeed(stream.flatMap(a => Stream(a, a)))
           } yield assertTrue(flatMapped.runCollect == Chunk(1, 1, 2, 2, 3, 3, 4, 4))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -198,7 +271,7 @@ object SimpleStream extends ZIOSpecDefault {
               User("msmith", "Mary Smith", 25)
             )
           )
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -211,7 +284,7 @@ object SimpleStream extends ZIOSpecDefault {
           for {
             mapped <- ZIO.succeed(stream.mapAccum(0)((acc, a) => (acc + a, acc + a)))
           } yield assertTrue(mapped.runCollect == Chunk(1, 3, 6, 10))
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -224,7 +297,7 @@ object SimpleStream extends ZIOSpecDefault {
           for {
             folded <- ZIO.succeed(stream.foldLeft(0)(_ + _))
           } yield assertTrue(folded == 10)
-        } @@ ignore
+        }
     } +
       suite("advanced constructors") {
 
