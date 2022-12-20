@@ -44,6 +44,14 @@ object SimpleStream extends ZIOSpecDefault {
   sealed trait Stream[+A] { self =>
     final def map[B](f: A => B): Stream[B] = self.flatMap(a => Stream(f(a)))
 
+    final def slidingWindowN(n: Int): Stream[Chunk[A]] =
+      mapAccum[Chunk[A], Chunk[A]](Chunk.empty) {
+        case (window, a) =>
+          val window2 = window :+ a
+
+          (window2.drop((window2.length - n).max(0)), window2)
+      }
+
     final def take(n: Int): Stream[A] =
       if (n <= 0) Stream.Empty
       else
@@ -479,6 +487,16 @@ object ResourcefulStream extends ZIOSpecDefault {
 
         readBytes().ensuring(fis.close())
       }
+
+    trait Serde[A]
+    trait KafkaMessage[A] {
+      def offset: Int
+      def message: A
+
+      def commit: Task[Unit]
+    }
+
+    def fromKafkaTopic[A: Serde](topic: String): Stream[KafkaMessage[A]] = ???
   }
 
   def spec = suite("ResourcefulStream") {

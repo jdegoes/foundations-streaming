@@ -21,6 +21,8 @@ import zio._
 import zio.test._
 import zio.test.TestAspect._
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ScheduledFuture
 
 /**
  * In this section, you will use the executionable push-based stream encoding
@@ -44,24 +46,131 @@ object ConcurrentSpec extends ZIOSpecDefault {
           self.receive(a => if (f(a)) onElement(a), onDone)
       }
 
-    final def merge[A1 >: A](that: => Stream[A1]): Stream[A1] = ???
+    final def merge[A1 >: A](that: => Stream[A1]): Stream[A1] =
+      new Stream[A1] {
+        def receive(onElement: A1 => Unit, onDone0: () => Unit): Unit = {
+          import scala.concurrent.ExecutionContext.global 
+          val doneCount = new AtomicInteger(0)
+          val onDone = () => {
+            if (doneCount.incrementAndGet() == 2) onDone0()
+          }
 
-    final def mapPar[B](f: A => B): Stream[B] = ???
+          global.execute(() => self.receive(onElement, onDone))
+          global.execute(() => that.receive(onElement, onDone))
+        }
+      }
 
-    final def flatMapPar[B](f: A => Stream[B]): Stream[B] = ???
+    final def mapPar[B](f: A => B): Stream[B] = 
+      new Stream[B] {
+        def receive(onElement: B => Unit, onDone: () => Unit): Unit = {
+          import scala.concurrent.ExecutionContext.global 
+          val pendingAs = new AtomicInteger(0)
 
-    final def batchUntil(maxSize: Int, maxDelay: Duration): Stream[Chunk[A]] = ???
+          self.receive(a => {
+            pendingAs.incrementAndGet()
+            global.execute { () => 
+              onElement(f(a))
+              pendingAs.decrementAndGet()
+            }
+          }, () => { 
+            while (pendingAs.get() != 0) Thread.`yield`(); onDone()
+          })
+        }
+      }
 
-    final def runCollect: Chunk[A] = {
-      val chunkRef = new AtomicReference[Chunk[A]](Chunk.empty)
+    final def flatMapPar[B](f: A => Stream[B]): Stream[B] = 
+      new Stream[B] {
+        def receive(onElement: B => Unit, onDone: () => Unit): Unit = {
+          import scala.concurrent.ExecutionContext.global 
+
+          self.receive(a => global.execute(() => f(a).receive(onElement, () => ())), onDone)
+        }
+      }
+
+    final def aggregateUntil(maxSize: Int, maxDelay: Duration): Stream[Chunk[A]] = 
+      new Stream[Chunk[A]] {
+        val scheduler = new java.util.concurrent.ScheduledThreadPoolExecutor(1)
+        var scheduled = Option.empty[ScheduledFuture[_]]
+
+        def receive(onElement: Chunk[A] => Unit, onDone: () => Unit): Unit = {
+          val chunkRef = new AtomicReference[Chunk[A]](Chunk.empty)
+
+          val sendAll: Runnable = 
+            () => {
+              val toSend = chunkRef.getAndUpdate(_ => Chunk.empty)
+
+              if (toSend.nonEmpty) onElement(toSend)
+            }
+
+          self.receive({ a =>
+            scheduled.foreach(_.cancel(true))
+            scheduled = Some(
+              scheduler.schedule(sendAll, maxDelay.toMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+            )
+
+            var toSend = Chunk.empty[A]
+
+            var loop = true 
+            while (loop) {
+              toSend = Chunk.empty 
+
+              val oldChunk = chunkRef.get 
+              val newChunk = chunkRef.get :+ a
+
+              if (newChunk.length >= maxSize) {
+                toSend = newChunk 
+                loop = !chunkRef.compareAndSet(oldChunk, Chunk.empty)
+              } else {
+                loop = !chunkRef.compareAndSet(oldChunk, newChunk)
+              }
+            }
+
+            if (toSend.nonEmpty) onElement(toSend)
+          }, () => {
+            val chunk = chunkRef.getAndUpdate(_ => Chunk.empty)
+
+            if (chunk.nonEmpty) onElement(chunk)
+
+            onDone()
+          })
+        }
+      }
+    
+    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] =
+      new Stream[A1] {
+        def receive(onElement: A1 => Unit, onDone: () => Unit): Unit =
+          self.receive(onElement, () => that.receive(onElement, onDone))
+      }
+
+    final def flatMap[B](f: A => Stream[B]): Stream[B] =
+      new Stream[B] {
+        def receive(onElement: B => Unit, onDone: () => Unit): Unit =
+          self.receive(a => f(a).receive(onElement, () => ()), onDone)
+      }
+
+    final def foldLeft[S](initial: S)(f: (S, A) => S): S = {
+      val stateRef = new AtomicReference[S](initial)
 
       val countDownLatch = new java.util.concurrent.CountDownLatch(1)
 
-      receive(a => chunkRef.updateAndGet(_ :+ a), () => countDownLatch.countDown())
+      receive(a => stateRef.updateAndGet(s0 => f(s0, a)), () => countDownLatch.countDown())
 
       countDownLatch.await()
 
-      chunkRef.get()
+      stateRef.get()
+    }    
+
+    final def mkString(sep: String): String =
+      self.foldLeft("") {
+        case (acc, a) =>
+          if (acc.nonEmpty) acc + sep + a.toString()
+          else a.toString()
+      }
+
+    final def runCollect: Chunk[A] = foldLeft[Chunk[A]](Chunk.empty[A])(_ :+ _)
+
+    final def runLast: Option[A] = foldLeft[Option[A]](None) {
+      case (_, a) => Some(a)
     }
   }
   object Stream {
@@ -118,13 +227,13 @@ object ConcurrentSpec extends ZIOSpecDefault {
       /**
        * EXERCISE
        *
-       * Implement the `batchUntil` operator on streams, which batches elements
+       * Implement the `aggregateUntil` operator on streams, which batches elements
        * of a stream until a maximum size or maximum delay is reached.
        */
-      test("batchUntil") {
+      test("aggregateUntil") {
         val stream = Stream(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 
-        val batched = stream.batchUntil(3, 1.second)
+        val batched = stream.aggregateUntil(3, 1.second)
 
         assertTrue(batched.runCollect.toSet == Set(Chunk(1, 2, 3), Chunk(4, 5, 6), Chunk(7, 8, 9), Chunk(10)))
       } @@ ignore
