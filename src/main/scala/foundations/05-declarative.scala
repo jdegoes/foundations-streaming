@@ -17,9 +17,9 @@ package foundations.declarative
 object Experiment {
   sealed trait Stream[+A]
   object Stream {
-    case object Empty                                                       extends Stream[Nothing]
-    final case class Make[+A](stream: ZIO[Scope, Throwable, Stream[A]])     extends Stream[A]
-    final case class Cons[+A](head: A, tail: Stream[A])                     extends Stream[A]
+    case object Empty                                                             extends Stream[Nothing]
+    final case class Make[+A](stream: ZIO[Scope, Throwable, Stream[A]])           extends Stream[A]
+    final case class Cons[+A](head: A, tail: Stream[A])                           extends Stream[A]
     final case class Ensuring[+A](stream: Stream[A], finalizer: IO[Nothing, Any]) extends Stream[A]
   }
 

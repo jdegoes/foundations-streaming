@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 object SimplePipelineSpec extends ZIOSpecDefault {
   final case class Pipeline[-A, +B](run: Stream[A] => Stream[B]) { self =>
-    def >>>[C](that: Pipeline[B, C]): Pipeline[A, C] = 
+    def >>>[C](that: Pipeline[B, C]): Pipeline[A, C] =
       Pipeline[A, C](self.run.andThen(that.run))
   }
   object Pipeline {
@@ -59,16 +59,16 @@ object SimplePipelineSpec extends ZIOSpecDefault {
       }
   }
   object Sink {
-    def drain: Sink[Any] = 
+    def drain: Sink[Any] =
       Sink(_.foldLeft(())((_, _) => ()))
 
-    def collectTo[A](ref: AtomicReference[Chunk[A]]): Sink[A] = 
+    def collectTo[A](ref: AtomicReference[Chunk[A]]): Sink[A] =
       foreach(a => ref.updateAndGet(_ :+ a))
 
-    def foreach[A](f: A => Unit): Sink[A] = 
+    def foreach[A](f: A => Unit): Sink[A] =
       Sink(_.foldLeft[Unit](()) { case (_, a) => f(a) })
 
-    def logElements[A](prefix: String): Sink[A] = 
+    def logElements[A](prefix: String): Sink[A] =
       if (prefix == "") foreach(a => println(a.toString()))
       else foreach(a => println(s"$prefix: $a"))
   }
@@ -216,21 +216,23 @@ object AdvancedPipelineSpec extends ZIOSpecDefault {
     def filter[A](f: A => Boolean): Pipeline[A, A] =
       Pipeline(_.filter(f))
 
-    def splitWords: Pipeline[String, String] = 
+    def splitWords: Pipeline[String, String] =
       Pipeline(stream => stream.flatMap(line => Stream(line.split("\\s+"): _*)))
 
-    def transform[S, A, B](s: S)(f: (S, A) => (S, Chunk[B])): Pipeline[A, B] = 
+    def transform[S, A, B](s: S)(f: (S, A) => (S, Chunk[B])): Pipeline[A, B] =
       Pipeline[A, B] { stream =>
-        stream.mapAccum(s) {
-          case (s, a) => f(s, a)
-        }.flatMap(chunk => Stream(chunk: _*))
+        stream
+          .mapAccum(s) {
+            case (s, a) => f(s, a)
+          }
+          .flatMap(chunk => Stream(chunk: _*))
       }
   }
   final case class Sink[-A, +B](run: Stream[A] => B) {
-    def &&[A1 <: A, C](that: Sink[A1, C]): Sink[A1, (B, C)] = 
+    def &&[A1 <: A, C](that: Sink[A1, C]): Sink[A1, (B, C)] =
       Sink(a => (run(a), that.run(a)))
 
-    def map[C](f: B => C): Sink[A, C] = 
+    def map[C](f: B => C): Sink[A, C] =
       Sink(a => f(run(a)))
   }
   object Sink {
@@ -244,12 +246,12 @@ object AdvancedPipelineSpec extends ZIOSpecDefault {
     def max[A](implicit n: Numeric[A]): Sink[A, A] =
       Sink(_.foldLeft(n.zero)(n.max))
 
-    def wordCount: Sink[String, Map[String, Int]] = 
-      Sink(_.foldLeft(Map.empty[String, Int]) { 
-        case (m, string) => 
-         string.split("\\s+").foldLeft(m) {
-          case (m, s) => m + (s -> (m.getOrElse(s, 0) + 1))
-         }
+    def wordCount: Sink[String, Map[String, Int]] =
+      Sink(_.foldLeft(Map.empty[String, Int]) {
+        case (m, string) =>
+          string.split("\\s+").foldLeft(m) {
+            case (m, s) => m + (s -> (m.getOrElse(s, 0) + 1))
+          }
       })
 
     def fold[S, A](s: S)(f: (S, A) => S): Sink[A, S] =

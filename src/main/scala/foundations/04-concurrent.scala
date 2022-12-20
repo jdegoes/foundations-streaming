@@ -49,7 +49,7 @@ object ConcurrentSpec extends ZIOSpecDefault {
     final def merge[A1 >: A](that: => Stream[A1]): Stream[A1] =
       new Stream[A1] {
         def receive(onElement: A1 => Unit, onDone0: () => Unit): Unit = {
-          import scala.concurrent.ExecutionContext.global 
+          import scala.concurrent.ExecutionContext.global
           val doneCount = new AtomicInteger(0)
           val onDone = () => {
             if (doneCount.incrementAndGet() == 2) onDone0()
@@ -60,34 +60,37 @@ object ConcurrentSpec extends ZIOSpecDefault {
         }
       }
 
-    final def mapPar[B](f: A => B): Stream[B] = 
+    final def mapPar[B](f: A => B): Stream[B] =
       new Stream[B] {
         def receive(onElement: B => Unit, onDone: () => Unit): Unit = {
-          import scala.concurrent.ExecutionContext.global 
+          import scala.concurrent.ExecutionContext.global
           val pendingAs = new AtomicInteger(0)
 
-          self.receive(a => {
-            pendingAs.incrementAndGet()
-            global.execute { () => 
-              onElement(f(a))
-              pendingAs.decrementAndGet()
+          self.receive(
+            a => {
+              pendingAs.incrementAndGet()
+              global.execute { () =>
+                onElement(f(a))
+                pendingAs.decrementAndGet()
+              }
+            },
+            () => {
+              while (pendingAs.get() != 0) Thread.`yield`(); onDone()
             }
-          }, () => { 
-            while (pendingAs.get() != 0) Thread.`yield`(); onDone()
-          })
+          )
         }
       }
 
-    final def flatMapPar[B](f: A => Stream[B]): Stream[B] = 
+    final def flatMapPar[B](f: A => Stream[B]): Stream[B] =
       new Stream[B] {
         def receive(onElement: B => Unit, onDone: () => Unit): Unit = {
-          import scala.concurrent.ExecutionContext.global 
+          import scala.concurrent.ExecutionContext.global
 
           self.receive(a => global.execute(() => f(a).receive(onElement, () => ())), onDone)
         }
       }
 
-    final def aggregateUntil(maxSize: Int, maxDelay: Duration): Stream[Chunk[A]] = 
+    final def aggregateUntil(maxSize: Int, maxDelay: Duration): Stream[Chunk[A]] =
       new Stream[Chunk[A]] {
         val scheduler = new java.util.concurrent.ScheduledThreadPoolExecutor(1)
         var scheduled = Option.empty[ScheduledFuture[_]]
@@ -95,47 +98,50 @@ object ConcurrentSpec extends ZIOSpecDefault {
         def receive(onElement: Chunk[A] => Unit, onDone: () => Unit): Unit = {
           val chunkRef = new AtomicReference[Chunk[A]](Chunk.empty)
 
-          val sendAll: Runnable = 
+          val sendAll: Runnable =
             () => {
               val toSend = chunkRef.getAndUpdate(_ => Chunk.empty)
 
               if (toSend.nonEmpty) onElement(toSend)
             }
 
-          self.receive({ a =>
-            scheduled.foreach(_.cancel(true))
-            scheduled = Some(
-              scheduler.schedule(sendAll, maxDelay.toMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
-            )
+          self.receive(
+            { a =>
+              scheduled.foreach(_.cancel(true))
+              scheduled = Some(
+                scheduler.schedule(sendAll, maxDelay.toMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+              )
 
-            var toSend = Chunk.empty[A]
+              var toSend = Chunk.empty[A]
 
-            var loop = true 
-            while (loop) {
-              toSend = Chunk.empty 
+              var loop = true
+              while (loop) {
+                toSend = Chunk.empty
 
-              val oldChunk = chunkRef.get 
-              val newChunk = chunkRef.get :+ a
+                val oldChunk = chunkRef.get
+                val newChunk = chunkRef.get :+ a
 
-              if (newChunk.length >= maxSize) {
-                toSend = newChunk 
-                loop = !chunkRef.compareAndSet(oldChunk, Chunk.empty)
-              } else {
-                loop = !chunkRef.compareAndSet(oldChunk, newChunk)
+                if (newChunk.length >= maxSize) {
+                  toSend = newChunk
+                  loop = !chunkRef.compareAndSet(oldChunk, Chunk.empty)
+                } else {
+                  loop = !chunkRef.compareAndSet(oldChunk, newChunk)
+                }
               }
+
+              if (toSend.nonEmpty) onElement(toSend)
+            },
+            () => {
+              val chunk = chunkRef.getAndUpdate(_ => Chunk.empty)
+
+              if (chunk.nonEmpty) onElement(chunk)
+
+              onDone()
             }
-
-            if (toSend.nonEmpty) onElement(toSend)
-          }, () => {
-            val chunk = chunkRef.getAndUpdate(_ => Chunk.empty)
-
-            if (chunk.nonEmpty) onElement(chunk)
-
-            onDone()
-          })
+          )
         }
       }
-    
+
     final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] =
       new Stream[A1] {
         def receive(onElement: A1 => Unit, onDone: () => Unit): Unit =
@@ -158,7 +164,7 @@ object ConcurrentSpec extends ZIOSpecDefault {
       countDownLatch.await()
 
       stateRef.get()
-    }    
+    }
 
     final def mkString(sep: String): String =
       self.foldLeft("") {
