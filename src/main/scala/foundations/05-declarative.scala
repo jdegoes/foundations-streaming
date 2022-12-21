@@ -14,14 +14,231 @@
  */
 package foundations.declarative
 
+// import zio._
+
 object Experiment {
-  sealed trait Stream[+A]
-  object Stream {
-    case object Empty                                                             extends Stream[Nothing]
-    final case class Make[+A](stream: ZIO[Scope, Throwable, Stream[A]])           extends Stream[A]
-    final case class Cons[+A](head: A, tail: Stream[A])                           extends Stream[A]
-    final case class Ensuring[+A](stream: Stream[A], finalizer: IO[Nothing, Any]) extends Stream[A]
+  import zio._
+
+  sealed trait Stream[+A] { self =>
+    import foundations.declarative.Experiment.Stream.{ Concat, Emit, Empty, Ensuring, Make }
+
+    final def ::[A1 >: A](a: A1): Stream[A1] = Stream.Emit(a) ++ self
+
+    final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] =
+      Stream.Concat(self, Stream.suspend(that))
+
+    final def drop(n: Int): Stream[A] =
+      if (n <= 0) self
+      else self.unconsToStreamWith(Stream.empty, (_, t) => t.drop(n - 1))
+
+    final def ensuring(finalizer: UIO[Any]): Stream[A] =
+      Stream.Ensuring(self, Stream.unwrap(finalizer.as(Stream.empty)))
+
+    final def filter(f: A => Boolean): Stream[A] =
+      self.flatMap(a => if (f(a)) Stream(a) else Stream.empty)
+
+    final def flatMap[B](f: A => Stream[B]): Stream[B] =
+      self match {
+        case Empty                       => Empty
+        case Make(make)                  => Stream.unwrap(make.map(_.flatMap(f)))
+        case Concat(left, right)         => left.flatMap(f) ++ right.flatMap(f)
+        case Emit(a)                     => f(a)
+        case Ensuring(stream, finalizer) => Ensuring(stream.flatMap(f), finalizer)
+      }
+
+    final def fold[S](s: S)(f: (S, A) => S): ZIO[Any, Throwable, S] = {
+      def loop(self: Stream[A], s: S): ZIO[Scope, Throwable, S] =
+        self match {
+          case Empty                       => ZIO.succeed(s)
+          case Make(make)                  => make.flatMap(loop(_, s))
+          case Concat(left, right)         => ZIO.scoped(loop(left, s)).flatMap(loop(right, _))
+          case Emit(a)                     => ZIO.succeed(f(s, a))
+          case Ensuring(stream, finalizer) => loop(stream, s).ensuring(finalizer.runDrain.orDie)
+        }
+
+      ZIO.scoped(loop(self, s))
+    }
+
+    final def foldZIO[S](s: S)(f: (S, A) => Task[S]): ZIO[Any, Throwable, S] = {
+      def loop(self: Stream[A], s: S): ZIO[Scope, Throwable, S] =
+        self match {
+          case Empty                       => ZIO.succeed(s)
+          case Make(make)                  => make.flatMap(loop(_, s))
+          case Concat(left, right)         => loop(left, s).flatMap(loop(right, _))
+          case Emit(a)                     => f(s, a)
+          case Ensuring(stream, finalizer) => loop(stream, s).ensuring(finalizer.runDrain.orDie)
+        }
+
+      ZIO.scoped(loop(self, s))
+    }
+
+    final def map[B](f: A => B): Stream[B] =
+      unconsToStreamWith(Stream.empty, (h, t) => f(h) :: t.map(f))
+
+    final def mapAccum[S, B](s: S)(f: (S, A) => (S, B)): Stream[B] =
+      Stream.unwrap {
+        for {
+          ref <- Ref.make(s)
+        } yield
+          self.mapZIO { a =>
+            for {
+              s       <- ref.get
+              (s2, b) = f(s, a)
+              _       <- ref.set(s2)
+            } yield b
+          }
+      }
+
+    final def mapZIO[B](f: A => Task[B]): Stream[B] =
+      self.flatMap(a => Stream.unwrap(f(a).map(Stream(_))))
+
+    final def merge[A1 >: A](that: Stream[A1]): Stream[A1] = {
+      type MergeState = Fiber[Throwable, Option[(A1, Stream[A1])]]
+
+      def unconsFork(stream: Stream[A1]): ZIO[Scope, Throwable, MergeState] =
+        stream.uncons.fork
+
+      def loop(left: Option[MergeState], right: Option[MergeState]): Stream[A1] =
+        (left, right) match {
+          case (None, None) => Stream.empty
+
+          case (Some(lfiber), None) =>
+            Stream.unwrap(lfiber.join.map {
+              case None                 => Stream.empty
+              case Some((lhead, ltail)) => Stream(lhead) ++ ltail
+            })
+
+          case (None, Some(rfiber)) =>
+            Stream.unwrap(rfiber.join.map {
+              case None                 => Stream.empty
+              case Some((rhead, rtail)) => Stream(rhead) ++ rtail
+            })
+
+          case (Some(lfiber), Some(rfiber)) =>
+            Stream.unwrap(
+              lfiber.join.raceWith[Scope, Throwable, Throwable, Option[(A1, Stream[A1])], Stream[A1]](rfiber.join)(
+                (leftDone, _) =>
+                  leftDone.flatMap[Scope, Throwable, Stream[A1]] {
+                    case None =>
+                      ZIO.succeed(loop(None, Some(rfiber)))
+
+                    case Some((lhead, ltail)) =>
+                      for {
+                        lfiber <- ltail.uncons.fork
+                      } yield Stream(lhead) ++ loop(Some(lfiber), Some(rfiber))
+                  },
+                (rightDone, _) =>
+                  rightDone.flatMap {
+                    case None =>
+                      ZIO.succeed(loop(Some(lfiber), None))
+
+                    case Some((rhead, rtail)) =>
+                      for {
+                        rfiber <- rtail.uncons.fork
+                      } yield Stream(rhead) ++ loop(Some(lfiber), Some(rfiber))
+                  }
+              )
+            )
+        }
+
+      Stream.unwrap(for {
+        lfiber <- self.uncons.fork
+        rfiber <- that.uncons.fork
+      } yield loop(Some(lfiber), Some(rfiber)))
+    }
+
+    final def mkString(sep: String): Task[String] =
+      self.fold("") {
+        case (acc, a) =>
+          if (acc.nonEmpty) acc + sep + a.toString()
+          else a.toString()
+      }
+
+    final def run[A1 >: A, B](sink: Sink[A1, B]): ZIO[Any, Throwable, B] = 
+      ZIO.scoped(sink.run(self).map(_._1))
+
+    final def runCollect: Task[Chunk[A]] =
+      fold[Chunk[A]](Chunk.empty[A])(_ :+ _)
+
+    final def runDrain: Task[Unit] = fold(())((_, _) => ())
+
+    final def runLast: Task[Option[A]] =
+      fold[Option[A]](None) {
+        case (_, a) => Some(a)
+      }
+
+    final def take(n: Int): Stream[A] =
+      if (n <= 0) Stream.empty
+      else self.unconsToStreamWith(Stream.empty, (h, t) => h :: t.take(n - 1))
+
+    final def transduce[A1 >: A, B](sink: Sink[A1, B]): Stream[B] =
+      Stream.unwrap(sink.run(self).map {
+        case (b, None)            => Stream(b)
+        case (b, Some(leftovers)) => b :: leftovers.transduce(sink)
+      })
+
+    final def uncons: ZIO[Scope, Throwable, Option[(A, Stream[A])]] =
+      self match {
+        case Empty      => ZIO.none
+        case Make(make) => make.flatMap(_.uncons)
+        case Concat(left, right) =>
+          left.uncons.flatMap {
+            case None               => right.uncons
+            case Some((head, tail)) => ZIO.some(head -> Stream.Concat(tail, right))
+          }
+        case Emit(value)                 => ZIO.some(value -> Stream.empty)
+        case Ensuring(stream, finalizer) => ZIO.addFinalizer(finalizer.runDrain.orDie) *> stream.uncons
+      }
+
+    def unconsWith[Z](empty: Z, cons: (A, Stream[A]) => Z): ZIO[Scope, Throwable, Z] =
+      unconsWithZIO(ZIO.succeed(empty), (h, t) => ZIO.succeed(cons(h, t)))
+
+    def unconsToStreamWith[B](empty: Stream[B], cons: (A, Stream[A]) => Stream[B]): Stream[B] =
+      Stream.unwrap(unconsWith(empty, cons))
+
+    def unconsWithZIO[Z](
+      empty: ZIO[Scope, Throwable, Z],
+      cons: (A, Stream[A]) => ZIO[Scope, Throwable, Z]
+    ): ZIO[Scope, Throwable, Z] =
+      uncons.flatMap {
+        case None               => empty
+        case Some((head, tail)) => cons(head, tail)
+      }
+
+    final def zip[B](that: => Stream[B]): Stream[(A, B)] =
+      Stream.unwrap(self.uncons.zip(that.uncons).map {
+        case (None, _)                                    => Stream.empty
+        case (_, None)                                    => Stream.empty
+        case (Some((lhead, ltail)), Some((rhead, rtail))) => (lhead, rhead) :: ltail.zip(rtail)
+      })
   }
+  object Stream {
+    private case object Empty                                                            extends Stream[Nothing]
+    private final case class Make[+A](make: ZIO[Scope, Throwable, Stream[A]])            extends Stream[A]
+    private final case class Ensuring[+A](stream: Stream[A], finalizer: Stream[Nothing]) extends Stream[A]
+    private final case class Emit[+A](value: A)                                          extends Stream[A]
+    private final case class Concat[+A](left: Stream[A], right: Stream[A])               extends Stream[A]
+
+    def apply[A](as: A*): Stream[A] =
+      as.foldRight[Stream[A]](empty)(_ :: _)
+
+    val empty: Stream[Nothing] = Empty
+
+    def fromZIO[A](zio: ZIO[Scope, Throwable, A]): Stream[A] =
+      Stream.unwrap(zio.map(Stream(_)))
+
+    def succeed[A](a: => A): Stream[A] = Stream.unwrap(ZIO.succeed(Stream(a)))
+
+    def suspend[A](stream: => Stream[A]): Stream[A] = Make(ZIO.attempt(stream))
+
+    def unwrap[A](make: ZIO[Scope, Throwable, Stream[A]]): Stream[A] = Make(make)
+  }
+
+  final case class Pipeline[-A, +B](run: Stream[A] => Stream[B]) { self =>
+    def >>>[C](that: Pipeline[B, C]): Pipeline[A, C] =
+      Pipeline(self.run.andThen(that.run))
+  }
+  final case class Sink[A, +B](run: Stream[A] => ZIO[Scope, Throwable, (B, Option[Stream[A]])])
 
 }
 
@@ -36,7 +253,8 @@ object DeclarativeSpec extends ZIOSpecDefault {
   sealed trait Stream[+A] { self =>
     final def >>>[B](pipeline: Pipeline[A, B]): Stream[B] = pipeline.run(self)
 
-    final def map[B](f: A => B): Stream[B] = ???
+    final def map[B](f: A => B): Stream[B] =
+      unconsToStreamWith(Stream.empty, (h, t) => Stream.Cons(f(h), t.map(f)))
 
     final def take(n: Int): Stream[A] = ???
 
@@ -73,6 +291,9 @@ object DeclarativeSpec extends ZIOSpecDefault {
     def unconsWith[Z](empty: Z, cons: (A, Stream[A]) => Z): ZIO[Scope, Throwable, Z] =
       unconsWithZIO(ZIO.succeed(empty), (h, t) => ZIO.succeed(cons(h, t)))
 
+    def unconsToStreamWith[B](empty: Stream[B], cons: (A, Stream[A]) => Stream[B]): Stream[B] =
+      Stream.unwrap(unconsWith(empty, cons))
+
     def unconsWithZIO[Z](
       empty: ZIO[Scope, Throwable, Z],
       cons: (A, Stream[A]) => ZIO[Scope, Throwable, Z]
@@ -103,19 +324,22 @@ object DeclarativeSpec extends ZIOSpecDefault {
       type A = Nothing
 
       def foldZIO[S](initial: S)(f: (S, A) => Task[Option[S]]): ZIO[Scope, Throwable, (S, Option[Stream[A]])] =
-        ???
+        ZIO.succeed(initial -> None)
     }
     final case class Make[+A](make: ZIO[Scope, Throwable, Stream[A]]) extends Stream[A] {
       def foldZIO[S](initial: S)(f: (S, A) => Task[Option[S]]): ZIO[Scope, Throwable, (S, Option[Stream[A]])] =
-        ???
+        make.flatMap(_.foldZIO(initial)(f))
     }
     final case class Cons[+A](head: A, tail: Stream[A]) extends Stream[A] {
       def foldZIO[S](initial: S)(f: (S, A) => Task[Option[S]]): ZIO[Scope, Throwable, (S, Option[Stream[A]])] =
-        ???
+        f(initial, head).flatMap {
+          case None          => ZIO.succeed(initial -> Some(tail))
+          case Some(initial) => tail.foldZIO(initial)(f)
+        }
     }
     final case class Ensuring[A](stream: Stream[A], finalizer: UIO[Any]) extends Stream[A] {
       def foldZIO[S](initial: S)(f: (S, A) => Task[Option[S]]): ZIO[Scope, Throwable, (S, Option[Stream[A]])] =
-        ???
+        ZIO.addFinalizer(finalizer) *> stream.foldZIO(initial)(f)
     }
 
     def apply[A](as: A*): Stream[A] =
@@ -179,7 +403,7 @@ object DeclarativeSpec extends ZIOSpecDefault {
 
     def leftover[A](l: Stream[A]): Sink[A, Unit] =
       Sink[A, Unit] { stream =>
-        ZIO.succeed(() -> Some((stream ++ l)))
+        ZIO.succeed(() -> Some((l ++ stream)))
       }
 
     def read[A]: Sink[A, A] =
