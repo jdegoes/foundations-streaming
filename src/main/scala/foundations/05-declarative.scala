@@ -20,9 +20,9 @@ object Experiment {
   import zio._
 
   sealed trait Stream[+A] { self =>
-    import foundations.declarative.Experiment.Stream.{ Concat, Emit, Empty, Ensuring, Make }
+    import foundations.declarative.Experiment.Stream.{ Concat, Empty, Ensuring, Make }
 
-    final def ::[A1 >: A](a: A1): Stream[A1] = Stream.Emit(a) ++ self
+    final def ::[A1 >: A](a: => A1): Stream[A1] = Stream.succeed(a) ++ self
 
     final def ++[A1 >: A](that: => Stream[A1]): Stream[A1] =
       Stream.Concat(self, Stream.suspend(that))
@@ -37,35 +37,26 @@ object Experiment {
     final def filter(f: A => Boolean): Stream[A] =
       self.flatMap(a => if (f(a)) Stream(a) else Stream.empty)
 
+    final def flatten[B](implicit ev: A <:< Stream[B]): Stream[B] =
+      self.flatMap(a => ev(a))
+
     final def flatMap[B](f: A => Stream[B]): Stream[B] =
       self match {
         case Empty                       => Empty
-        case Make(make)                  => Stream.unwrap(make.map(_.flatMap(f)))
+        case Make(make)                  => Stream.unwrap(make.map(f))
         case Concat(left, right)         => left.flatMap(f) ++ right.flatMap(f)
-        case Emit(a)                     => f(a)
         case Ensuring(stream, finalizer) => Ensuring(stream.flatMap(f), finalizer)
       }
 
-    final def fold[S](s: S)(f: (S, A) => S): ZIO[Any, Throwable, S] = {
-      def loop(self: Stream[A], s: S): ZIO[Scope, Throwable, S] =
-        self match {
-          case Empty                       => ZIO.succeed(s)
-          case Make(make)                  => make.flatMap(loop(_, s))
-          case Concat(left, right)         => ZIO.scoped(loop(left, s)).flatMap(loop(right, _))
-          case Emit(a)                     => ZIO.succeed(f(s, a))
-          case Ensuring(stream, finalizer) => loop(stream, s).ensuring(finalizer.runDrain.orDie)
-        }
-
-      ZIO.scoped(loop(self, s))
-    }
+    final def fold[S](s: S)(f: (S, A) => S): ZIO[Any, Throwable, S] =
+      self.foldZIO(s)((s, a) => ZIO.succeed(f(s, a)))
 
     final def foldZIO[S](s: S)(f: (S, A) => Task[S]): ZIO[Any, Throwable, S] = {
       def loop(self: Stream[A], s: S): ZIO[Scope, Throwable, S] =
         self match {
           case Empty                       => ZIO.succeed(s)
-          case Make(make)                  => make.flatMap(loop(_, s))
+          case Make(make)                  => make.flatMap(f(s, _))
           case Concat(left, right)         => loop(left, s).flatMap(loop(right, _))
-          case Emit(a)                     => f(s, a)
           case Ensuring(stream, finalizer) => loop(stream, s).ensuring(finalizer.runDrain.orDie)
         }
 
@@ -154,7 +145,7 @@ object Experiment {
           else a.toString()
       }
 
-    final def run[A1 >: A, B](sink: Sink[A1, B]): ZIO[Any, Throwable, B] = 
+    final def run[A1 >: A, B](sink: Sink[A1, B]): ZIO[Any, Throwable, B] =
       ZIO.scoped(sink.run(self).map(_._1))
 
     final def runCollect: Task[Chunk[A]] =
@@ -180,13 +171,12 @@ object Experiment {
     final def uncons: ZIO[Scope, Throwable, Option[(A, Stream[A])]] =
       self match {
         case Empty      => ZIO.none
-        case Make(make) => make.flatMap(_.uncons)
+        case Make(make) => make.map(a => Some(a -> Stream.empty))
         case Concat(left, right) =>
           left.uncons.flatMap {
             case None               => right.uncons
             case Some((head, tail)) => ZIO.some(head -> Stream.Concat(tail, right))
           }
-        case Emit(value)                 => ZIO.some(value -> Stream.empty)
         case Ensuring(stream, finalizer) => ZIO.addFinalizer(finalizer.runDrain.orDie) *> stream.uncons
       }
 
@@ -214,9 +204,8 @@ object Experiment {
   }
   object Stream {
     private case object Empty                                                            extends Stream[Nothing]
-    private final case class Make[+A](make: ZIO[Scope, Throwable, Stream[A]])            extends Stream[A]
+    private final case class Make[+A](make: ZIO[Scope, Throwable, A])                    extends Stream[A]
     private final case class Ensuring[+A](stream: Stream[A], finalizer: Stream[Nothing]) extends Stream[A]
-    private final case class Emit[+A](value: A)                                          extends Stream[A]
     private final case class Concat[+A](left: Stream[A], right: Stream[A])               extends Stream[A]
 
     def apply[A](as: A*): Stream[A] =
@@ -227,11 +216,11 @@ object Experiment {
     def fromZIO[A](zio: ZIO[Scope, Throwable, A]): Stream[A] =
       Stream.unwrap(zio.map(Stream(_)))
 
-    def succeed[A](a: => A): Stream[A] = Stream.unwrap(ZIO.succeed(Stream(a)))
+    def succeed[A](a: => A): Stream[A] = Make(ZIO.succeed(a))
 
-    def suspend[A](stream: => Stream[A]): Stream[A] = Make(ZIO.attempt(stream))
+    def suspend[A](stream: => Stream[A]): Stream[A] = Make(ZIO.attempt(stream)).flatten
 
-    def unwrap[A](make: ZIO[Scope, Throwable, Stream[A]]): Stream[A] = Make(make)
+    def unwrap[A](make: ZIO[Scope, Throwable, Stream[A]]): Stream[A] = Make(make).flatten
   }
 
   final case class Pipeline[-A, +B](run: Stream[A] => Stream[B]) { self =>
